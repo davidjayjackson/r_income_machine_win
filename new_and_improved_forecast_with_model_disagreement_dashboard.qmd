@@ -1,0 +1,580 @@
+---
+title: "New and Improved Weekly Analysis"
+format: pdf
+toc: true
+editor: visual
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Income Funds
+* JPMorgan Equity Premium Income ETF (JEPI)
+* Global X NASDAQ 100 Covered Call ETF (QYLD)
+* Schwab U.S. Dividend Equity ETF( SCHD)
+
+```{r, message=FALSE, echo=FALSE}
+library(tidyquant)
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(fable)
+library(feasts)
+library(TTR)
+library(scales)
+library(patchwork)
+library(fable.prophet)
+library(prophet)
+library(ggtime)
+```
+
+##  JPMorgan Equity Premium Income ETF (JEPI)
+
+```{r}
+rm(list = ls())
+
+# ---- settings ----
+# tickers
+symbol <- c("JEPI","QYLD","SCHD")
+from_date <- "2025-04-01"
+week_start_day <- 1
+h_weeks <- 12
+history_weeks <- 26
+
+# Fixed Prophet training start dates and forecast anchor
+params <- list(
+  start_date_6m   = as.Date("2025-10-01"),
+  start_date_12m  = as.Date("2025-04-01"),
+  forecast_start  = as.Date("2026-04-01"),
+  forecast_horizon = 30
+)
+
+# ---- daily data ----
+daily <- tq_get("JEPI", get = "stock.prices", from = from_date) %>%
+  select(date, close, adjusted) %>%
+  arrange(date) %>%
+  mutate(
+    EMA_21  = EMA(close, 21),
+    SMA_100 = SMA(close, 100)
+  ) %>%
+  mutate(
+    MACD = MACD(close)[, "macd"],
+    Signal = MACD(close)[, "signal"],
+    Histogram = MACD - Signal
+  )
+
+# Weekly aggregation
+weekly <- daily %>%
+  mutate(week = floor_date(date, "week", week_start = week_start_day)) %>%
+  group_by(week) %>%
+  summarise(close = mean(close, na.rm = TRUE), .groups = "drop") %>%
+  as_tsibble(index = week)
+
+# Prophet helper ----
+run_prophet_forecast <- function(data, start_date, forecast_start, horizon_days = 30) {
+  train <- data %>%
+    filter(date >= start_date,
+           date < forecast_start) %>%
+    transmute(ds = as.Date(date), y = close)
+
+  m <- prophet(
+    train,
+    yearly.seasonality = TRUE,
+    weekly.seasonality = TRUE,
+    daily.seasonality = FALSE
+  )
+
+  future <- make_future_dataframe(
+    m,
+    periods = 60,
+    freq = "day",
+    include_history = FALSE
+  ) %>%
+    mutate(ds = as.Date(ds)) %>%
+    filter(ds >= forecast_start) %>%
+    filter(weekdays(ds) %in% c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday")) %>%
+    slice_head(n = horizon_days)
+
+  fc <- predict(m, future) %>%
+    transmute(
+      ds = as.Date(ds),
+      yhat,
+      yhat_lower,
+      yhat_upper
+    )
+
+  list(train = train, forecast = fc)
+}
+
+prophet_6m <- run_prophet_forecast(
+  daily,
+  start_date = params$start_date_6m,
+  forecast_start = params$forecast_start,
+  horizon_days = params$forecast_horizon
+)
+
+prophet_12m <- run_prophet_forecast(
+  daily,
+  start_date = params$start_date_12m,
+  forecast_start = params$forecast_start,
+  horizon_days = params$forecast_horizon
+)
+```
+
+```{r}
+# Models + forecast
+
+fits <- weekly %>%
+  model(
+    ETS     = ETS(close),
+    ARIMA   = ARIMA(close),
+    # PROPHET = prophet(close ~ season("year", 52)),
+    NAIVE   = NAIVE(close)
+  )
+
+fc_weekly <- fits %>% forecast(h = h_weeks)
+
+fit_stats <- fits %>%
+  accuracy() %>%
+  select(.model, ME, MAE, RMSE, MAPE, MASE, ACF1)
+```
+
+```{r}
+# Performance calculations
+
+perf <- daily %>%
+  tq_transmute(
+    select = adjusted,
+    mutate_fun = periodReturn,
+    period = "daily",
+    type = "arithmetic",
+    col_rename = "returns"
+  ) %>%
+  mutate(
+    wealth = cumprod(1 + returns),
+    cumulative_returns = wealth - 1,
+    value_10000 = 10000 * wealth,
+    peak_value = cummax(value_10000),
+    drawdown = value_10000 / peak_value - 1
+  )
+```
+
+## Close with 21 Day EMA & 100 Day SMA
+
+```{r}
+daily %>%
+  filter(date >= max(date) - days(180)) %>%
+  ggplot(aes(date)) +
+  geom_line(aes(y = close, color = "Close"), linewidth = 1) +
+  geom_line(aes(y = EMA_21, color = "EMA 21"), linewidth = 1) +
+  geom_line(aes(y = SMA_100, color = "SMA 100"), linewidth = 1) +
+  labs(title = paste(symbol, "Close with EMA & SMA"),
+       y = "Price", x = NULL)
+```
+
+## MacD Plot
+
+```{r}
+daily %>%
+  filter(date >= max(date) - days(180)) %>%
+  ggplot(aes(date)) +
+  geom_col(aes(y = Histogram), fill = "green") +
+  geom_line(aes(y = MACD, color = "MACD"), linewidth = 1) +
+  geom_line(aes(y = Signal, color = "Signal"), linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = "dotted") +
+  labs(title = paste(symbol, "MACD"), x = NULL, y = "MACD")
+```
+
+## First and Last close by Month
+
+```{r}
+# Filter to most recent 12 months
+recent_daily <- daily %>%
+  filter(date >= max(date) - months(12))
+
+# Summarise monthly first/last close
+month_summary <- recent_daily %>%
+  mutate(Month = floor_date(date, "month")) %>%
+  group_by(Month) %>%
+  arrange(date, .by_group = TRUE) %>%
+  summarise(
+    FirstDate  = first(date),
+    LastDate   = last(date),
+    FirstClose = first(close),
+    LastClose  = last(close),
+    Direction  = ifelse(LastClose >= FirstClose, "Up", "Down"),
+    .groups = "drop"
+  )
+
+# Pivot longer → 2 rows per month
+month_points <- month_summary %>%
+  pivot_longer(
+    cols = c(FirstDate, LastDate, FirstClose, LastClose),
+    names_to = c("Type", ".value"),
+    names_pattern = "(First|Last)(.*)"
+  ) %>%
+  mutate(MonthLabel = format(Month, "%b %Y")) %>%
+  mutate(MonthLabel = factor(MonthLabel, levels = rev(unique(MonthLabel))))
+
+# Horizontal plot
+ggplot(month_points,
+       aes(x = Close, y = MonthLabel, group = Month, color = Direction)) +
+  geom_line(linewidth = 1) +
+  geom_point(aes(shape = Type), size = 3) +
+  scale_shape_manual(values = c(First = 16, Last = 17)) +
+  scale_color_manual(values = c(Up = "forestgreen", Down = "firebrick")) +
+  labs(
+    title = paste("Monthly First ↔ Last Closing Prices for", symbol),
+    subtitle = "Last 12 Months | Green = Up | Red = Down",
+    x = "Closing Price ($)",
+    y = "Month"
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(size = 10)
+  )
+```
+
+### Bollinger Bands
+
+```{r}
+VASGX_bb <- daily %>%  filter(date >="2026-01-01") |>
+  tq_mutate(select = close, mutate_fun = BBands) |> na.omit()
+
+ggplot(VASGX_bb, aes(x = date)) +
+  geom_ribbon(aes(ymin = dn, ymax = up), fill = "lightblue", alpha = 0.3) +
+  geom_line(aes(y = close), color = "blue", linewidth= 0.8) +
+  geom_line(aes(y = up), color = "red", linetype = "dashed") +
+  geom_line(aes(y = dn), color = "red", linetype = "dashed") +
+  geom_line(aes(y = mavg), color = "darkgreen", linetype = "dotdash") +
+  labs(title = "Bollinger Bands (YTD)", x = "Date", y = "Closing Price") +
+  theme_tq()
+
+```
+
+## Cumulative returns and \$10,000 invested
+
+```{r}
+ggplot(perf, aes(date, cumulative_returns)) +
+  geom_area(fill = "steelblue", alpha = 0.7) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Cumulative Returns", x = NULL, y = "Cumulative Return") +
+  theme_minimal()
+```
+
+```{r}
+ggplot(perf, aes(date, value_10000)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = dollar) +
+  labs(title = "Value of $10,000 Invested", x = NULL, y = "Portfolio Value") +
+  theme_minimal()
+```
+
+## Drawdown
+
+```{r}
+ggplot(perf, aes(date, drawdown)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = percent) +
+  coord_cartesian(ylim = c(-0.25, 0.05)) +
+  labs(title = "Drawdown", x = NULL, y = "Drawdown") +
+  theme_minimal()
+```
+## JPMorgan Equity Premium Income ETF (JEPI)
+### Weekly Average Close Forecast
+
+```{r}
+fit_stats
+```
+
+```{r}
+weekly %>%
+  filter(week >= max(week) - weeks(history_weeks)) %>%
+  ggtime::autoplot(close) +
+  autolayer(fc_weekly, level = 95) +
+  labs(title = paste(symbol, "Weekly Average Close Forecast"),
+       x = NULL, y = "Weekly Avg Close")
+```
+
+## Prophet Forecast (30 Trading Days, 6 Months Training Data)
+
+```{r}
+prophet_6m_plot_data <- bind_rows(
+  prophet_6m$train %>% mutate(series = "Actual") %>% rename(value = y),
+  prophet_6m$forecast %>% mutate(series = "Forecast") %>% rename(value = yhat)
+)
+
+ggplot() +
+  geom_line(
+    data = prophet_6m$train,
+    aes(x = ds, y = y, color = "Actual"),
+    linewidth = 1
+  ) +
+  geom_ribbon(
+    data = prophet_6m$forecast,
+    aes(x = ds, ymin = yhat_lower, ymax = yhat_upper),
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = prophet_6m$forecast,
+    aes(x = ds, y = yhat, color = "Forecast"),
+    linewidth = 1
+  ) +
+  geom_vline(
+    xintercept = as.numeric(params$forecast_start),
+    linetype = "dashed"
+  ) +
+  labs(
+    title = paste(symbol, "Prophet Forecast - 30 Trading Days"),
+    subtitle = paste("Training:", params$start_date_6m, "to", params$forecast_start - 1, "| Forecast starts:", params$forecast_start),
+    x = NULL,
+    y = "Close"
+  )
+```
+
+## Prophet Forecast (30 Trading Days, 12 Months Training Data)
+
+```{r}
+ggplot() +
+  geom_line(
+    data = prophet_12m$train,
+    aes(x = ds, y = y, color = "Actual"),
+    linewidth = 1
+  ) +
+  geom_ribbon(
+    data = prophet_12m$forecast,
+    aes(x = ds, ymin = yhat_lower, ymax = yhat_upper),
+    alpha = 0.2
+  ) +
+  geom_line(
+    data = prophet_12m$forecast,
+    aes(x = ds, y = yhat, color = "Forecast"),
+    linewidth = 1
+  ) +
+  geom_vline(
+    xintercept = as.numeric(params$forecast_start),
+    linetype = "dashed"
+  ) +
+  labs(
+    title = paste(symbol, "Prophet Forecast - 30 Trading Days"),
+    subtitle = paste("Training:", params$start_date_12m, "to", params$forecast_start - 1, "| Forecast starts:", params$forecast_start),
+    x = NULL,
+    y = "Close"
+  )
+```
+
+## Prophet Comparison Table
+
+```{r}
+prophet_6m_last  <- tail(prophet_6m$forecast$yhat, 1)
+prophet_12m_last <- tail(prophet_12m$forecast$yhat, 1)
+
+comparison_tbl <- tibble(
+  Model = c("Prophet 6M", "Prophet 12M"),
+  Final_Forecast = c(prophet_6m_last, prophet_12m_last)
+) %>%
+  mutate(
+    Difference_vs_6M = Final_Forecast - first(Final_Forecast)
+  )
+
+comparison_tbl
+```
+
+## Prophet Forecast Overlay Comparison
+
+```{r}
+overlay_actual <- daily %>%
+  filter(date >= max(date) - months(12)) %>%
+  select(ds = date, y = close)
+
+overlay_forecast <- bind_rows(
+  prophet_6m$forecast %>%
+    transmute(ds, yhat, Model = "Prophet 6M"),
+  prophet_12m$forecast %>%
+    transmute(ds, yhat, Model = "Prophet 12M")
+)
+
+ggplot() +
+  geom_line(
+    data = overlay_actual,
+    aes(x = ds, y = y, color = "Actual"),
+    linewidth = 1
+  ) +
+  geom_line(
+    data = overlay_forecast,
+    aes(x = ds, y = yhat, color = Model),
+    linewidth = 1
+  ) +
+  geom_vline(
+    xintercept = as.numeric(params$forecast_start),
+    linetype = "dashed"
+  ) +
+  labs(
+    title = paste(symbol, "Prophet Forecast Comparison"),
+    subtitle = paste("30 trading-day forecast from", params$forecast_start, "| training starts:", params$start_date_6m, "vs", params$start_date_12m),
+    x = NULL,
+    y = "Close",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Model Disagreement Dashboard
+
+```{r}
+# Build disagreement dataset
+forecast_compare <- prophet_6m$forecast %>%
+  rename(
+    forecast_6m = yhat,
+    lower_6m = yhat_lower,
+    upper_6m = yhat_upper
+  ) %>%
+  inner_join(
+    prophet_12m$forecast %>%
+      rename(
+        forecast_12m = yhat,
+        lower_12m = yhat_lower,
+        upper_12m = yhat_upper
+      ),
+    by = "ds"
+  ) %>%
+  mutate(
+    abs_diff = abs(forecast_6m - forecast_12m),
+    pct_diff = abs_diff / ((forecast_6m + forecast_12m) / 2),
+    higher_model = case_when(
+      forecast_6m > forecast_12m ~ "Prophet 6M",
+      forecast_12m > forecast_6m ~ "Prophet 12M",
+      TRUE ~ "Tie"
+    )
+  )
+
+summary_metrics <- tibble(
+  Metric = c(
+    "Forecast start",
+    "Forecast horizon (trading days)",
+    "6M final forecast",
+    "12M final forecast",
+    "Final-day absolute gap",
+    "Final-day percent gap",
+    "Average gap across horizon",
+    "Maximum gap across horizon",
+    "Higher on final day"
+  ),
+  Value = c(
+    as.character(min(forecast_compare$ds)),
+    as.character(nrow(forecast_compare)),
+    sprintf("%.2f", last(forecast_compare$forecast_6m)),
+    sprintf("%.2f", last(forecast_compare$forecast_12m)),
+    sprintf("%.2f", last(forecast_compare$abs_diff)),
+    percent(last(forecast_compare$pct_diff), accuracy = 0.1),
+    sprintf("%.2f", mean(forecast_compare$abs_diff)),
+    sprintf("%.2f", max(forecast_compare$abs_diff)),
+    last(forecast_compare$higher_model)
+  )
+)
+
+recent_actual <- daily %>%
+  filter(date >= params$forecast_start - months(6)) %>%
+  transmute(ds = date, close)
+
+forecast_long <- forecast_compare %>%
+  select(ds, forecast_6m, forecast_12m) %>%
+  pivot_longer(-ds, names_to = "model", values_to = "forecast") %>%
+  mutate(
+    model = recode(
+      model,
+      forecast_6m = "Prophet 6M",
+      forecast_12m = "Prophet 12M"
+    )
+  )
+
+p_overlay <- ggplot() +
+  geom_line(
+    data = recent_actual,
+    aes(x = ds, y = close, color = "Actual"),
+    linewidth = 1
+  ) +
+  geom_line(
+    data = forecast_long,
+    aes(x = ds, y = forecast, color = model),
+    linewidth = 1
+  ) +
+  geom_vline(
+    xintercept = as.numeric(params$forecast_start),
+    linetype = "dashed"
+  ) +
+  labs(
+    title = "Forecast paths",
+    subtitle = "Actual close plus 6M and 12M Prophet forecasts",
+    x = NULL,
+    y = "Close",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+p_gap <- ggplot(forecast_compare, aes(x = ds, y = abs_diff)) +
+  geom_col() +
+  geom_hline(yintercept = mean(forecast_compare$abs_diff), linetype = "dotted") +
+  labs(
+    title = "Disagreement gap by day",
+    subtitle = "Absolute difference between 6M and 12M forecasts",
+    x = NULL,
+    y = "Absolute gap"
+  ) +
+  theme_minimal()
+
+final_day_tbl <- forecast_compare %>%
+  slice_tail(n = 1) %>%
+  transmute(
+    model_6m = forecast_6m,
+    model_12m = forecast_12m
+  ) %>%
+  pivot_longer(everything(), names_to = "model", values_to = "forecast") %>%
+  mutate(
+    model = recode(
+      model,
+      model_6m = "Prophet 6M",
+      model_12m = "Prophet 12M"
+    )
+  )
+
+p_final <- ggplot(final_day_tbl, aes(x = model, y = forecast, fill = model)) +
+  geom_col(show.legend = FALSE) +
+  labs(
+    title = "Final-day forecast",
+    subtitle = paste("Forecast date:", max(forecast_compare$ds)),
+    x = NULL,
+    y = "Forecast close"
+  ) +
+  theme_minimal()
+
+(p_overlay / (p_gap | p_final)) +
+  plot_annotation(
+    title = paste(symbol, "Model Disagreement Dashboard"),
+    subtitle = paste(
+      "Forecast start:", params$forecast_start,
+      "| 6M start:", params$start_date_6m,
+      "| 12M start:", params$start_date_12m
+    )
+  )
+```
+
+```{r}
+summary_metrics
+```
+
+```{r}
+forecast_compare %>%
+  transmute(
+    date = ds,
+    `Prophet 6M` = round(forecast_6m, 2),
+    `Prophet 12M` = round(forecast_12m, 2),
+    `Abs Gap` = round(abs_diff, 2),
+    `Pct Gap` = percent(pct_diff, accuracy = 0.1),
+    `Higher Model` = higher_model
+  )
+```
