@@ -1,0 +1,149 @@
+---
+title: "Income Estimates (Dollar Amounts)"
+format: html
+editor: visual
+toc: true
+---
+
+```{r,message=FALSE,echo=FALSE}
+library(tidyverse)
+library(tidyquant)
+library(lubridate)
+rm(list=ls())
+# -----------------------------
+# 1) Enter the stocks and the actual dollar amount
+#    you are investing in each one
+# -----------------------------
+alloc_input <- tibble(
+  symbol  = c("JEPI", "QYLD", "SCHD"),
+  dollars = c(10000, 10000, 10000)
+)
+
+symbols <- alloc_input$symbol
+
+if (any(is.na(alloc_input$dollars)) || any(alloc_input$dollars < 0)) {
+  stop("Each dollar amount must be a non-negative number.")
+}
+
+# total invested is the sum of what you entered
+total_investment <- sum(alloc_input$dollars)
+
+# -----------------------------
+# 2) Derive the percent each stock represents
+# -----------------------------
+alloc_tbl <- alloc_input %>%
+  mutate(
+    weight  = dollars / total_investment,
+    percent = weight * 100
+  )
+
+# -----------------------------
+# 3) Get latest stock prices
+# -----------------------------
+prices_tbl <- tq_get(symbols, get = "stock.prices") %>%
+  group_by(symbol) %>%
+  slice_max(date, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(symbol, price = adjusted)
+```
+
+```{r}
+# -----------------------------
+# 4) Get dividend history
+#    Use the last 12 months to estimate annual dividends/share
+# -----------------------------
+div_tbl <- tq_get(symbols, get = "dividends") %>%
+  mutate(date = as.Date(date))
+last_date <- max(div_tbl$date, na.rm = TRUE)
+
+annual_div_tbl <- div_tbl %>%
+  filter(!is.na(value)) %>%
+  filter(date > last_date %m-% months(12)) %>%
+  group_by(symbol) %>%
+  summarise(
+    annual_dividend_per_share = sum(value, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r}
+# -----------------------------
+# 5) Combine allocation, price, and dividend data
+# -----------------------------
+income_tbl <- alloc_tbl %>%
+  left_join(prices_tbl, by = "symbol") %>%
+  left_join(annual_div_tbl, by = "symbol") %>%
+  mutate(
+    dollars_invested = dollars,
+    shares_estimated = dollars_invested / price,
+    annual_income = shares_estimated * annual_dividend_per_share,
+    monthly_income = annual_income / 12,
+    dividend_yield = annual_dividend_per_share / price
+  ) %>%
+  arrange(desc(monthly_income))
+```
+
+```{r}
+# -----------------------------
+# 6) View stock-by-stock estimates
+# -----------------------------
+income_tbl %>%
+  transmute(
+    symbol,
+    percent = round(percent, 2),
+    price = round(price, 2),
+    annual_dividend_per_share = round(annual_dividend_per_share, 2),
+    dividend_yield = scales::percent(dividend_yield, accuracy = 0.01),
+    dollars_invested = round(dollars_invested, 2),
+    shares_estimated = round(shares_estimated, 2),
+    annual_income = round(annual_income, 2),
+    monthly_income = round(monthly_income, 2)
+  )
+
+# -----------------------------
+# 7) Total invested and total estimated income
+# -----------------------------
+income_tbl %>%
+  summarise(
+    total_invested = sum(dollars_invested, na.rm = TRUE),
+    total_annual_income = sum(annual_income, na.rm = TRUE),
+    total_monthly_income = sum(monthly_income, na.rm = TRUE)
+  )
+```
+
+```{r}
+summary_tbl <- income_tbl %>%
+  transmute(
+    symbol,
+    percent,
+    invested = dollars_invested,
+    yield = dividend_yield,
+    annual_income,
+    monthly_income
+  ) %>%
+  mutate(
+    percent = round(percent, 2),
+    invested = round(invested, 0),
+    yield = scales::percent(yield, accuracy = 0.01),
+    annual_income = round(annual_income, 2),
+    monthly_income = round(monthly_income, 2)
+  )
+
+print(summary_tbl)
+```
+
+```{r}
+ggplot(summary_tbl) + geom_col(aes(x=symbol,y=invested))
+```
+
+```{r}
+ggplot(summary_tbl) + geom_col(aes(x=symbol,y=percent))
+```
+
+```{r}
+ggplot(summary_tbl) + geom_col(aes(x=symbol,y=annual_income))
+```
+
+```{r}
+ggplot(summary_tbl) + geom_col(aes(x=symbol,y=monthly_income))
+```
