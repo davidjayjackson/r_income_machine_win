@@ -12,12 +12,12 @@ con <- dbConnect(
   MariaDB(),
   host     = "localhost",
   user     = "root",
-  password = "dJj135790",
+  password = "Bjmj3265",
   dbname   = "invest",
   port = 3333
 )
 
-symbols <- c("JEPI","QYLD","SCHD")
+symbols <- c("JEPI","QYLD","SCHD","JEPQ")
 stocks <- tq_get(symbols, get = "stock.prices",from="2000-01-01")
 dbWriteTable(con,"stocks",stocks, overwrite=TRUE)
 dbListTables(con)

@@ -15,8 +15,8 @@ rm(list=ls())
 #    you are investing in each one
 # -----------------------------
 alloc_input <- tibble(
-  symbol  = c("JEPI", "QYLD", "SCHD"),
-  dollars = c(10000, 10000, 10000)
+  symbol  = c("JEPI","JEPQ", "QYLD", "SCHD"),
+  dollars = c(50981, 25000,10000,47000)
 )
 
 symbols <- alloc_input$symbol
